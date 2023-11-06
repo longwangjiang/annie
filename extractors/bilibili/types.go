@@ -13,11 +13,13 @@ type token struct {
 }
 
 type bangumiEpData struct {
-	Aid  int    `json:"aid"`
-	Cid  int    `json:"cid"`
-	BVid string `json:"bvid"`
-	ID   int    `json:"id"`
-	EpID int    `json:"ep_id"`
+	Aid         int    `json:"aid"`
+	Cid         int    `json:"cid"`
+	BVid        string `json:"bvid"`
+	ID          int    `json:"id"`
+	EpID        int    `json:"ep_id"`
+	TitleFormat string `json:"titleFormat"`
+	LongTitle   string `json:"long_title"`
 }
 
 type bangumiData struct {
@@ -129,7 +131,7 @@ type subtitleProperty struct {
 
 type subtitleInfo struct {
 	AllowSubmit  bool               `json:"allow_submit"`
-	SubtitleList []subtitleProperty `json:"list"`
+	SubtitleList []subtitleProperty `json:"subtitles"`
 }
 
 type bilibiliWebInterfaceData struct {

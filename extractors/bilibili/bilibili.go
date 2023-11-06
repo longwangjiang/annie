@@ -3,11 +3,12 @@ package bilibili
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/iawia002/lia/array"
 	"github.com/pkg/errors"
 
 	"github.com/iawia002/lux/extractors"
@@ -17,7 +18,9 @@ import (
 )
 
 func init() {
-	extractors.Register("bilibili", New())
+	bilibiliExtractor := New()
+	extractors.Register("bilibili", bilibiliExtractor)
+	extractors.Register("b23", bilibiliExtractor)
 }
 
 const (
@@ -92,20 +95,50 @@ type bilibiliOptions struct {
 }
 
 func extractBangumi(url, html string, extractOption extractors.Options) ([]*extractors.Data, error) {
-	dataString := utils.MatchOneOf(html, `window.__INITIAL_STATE__=(.+?);\(function`)[1]
-	var data bangumiData
-	err := json.Unmarshal([]byte(dataString), &data)
+	dataString := utils.MatchOneOf(html, `<script\s+id="__NEXT_DATA__"\s+type="application/json"\s*>(.*?)</script\s*>`)[1]
+	epArrayString := utils.MatchOneOf(dataString, `"episodes"\s*:\s*(.+?)\s*,\s*"user_status"`)[1]
+	fullVideoIdString := utils.MatchOneOf(dataString, `"videoId"\s*:\s*"(ep|ss)(\d+)"`)
+	epSsString := fullVideoIdString[1] // "ep" or "ss"
+	videoIdString := fullVideoIdString[2]
+
+	var epArray []json.RawMessage
+	err := json.Unmarshal([]byte(epArrayString), &epArray)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	var data bangumiData
+	for _, jsonByte := range epArray {
+		var epInfo bangumiEpData
+		err := json.Unmarshal(jsonByte, &epInfo)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		videoId, err := strconv.ParseInt(videoIdString, 10, 0)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if epInfo.ID == int(videoId) || (epSsString == "ss" && epInfo.TitleFormat == "第1话") {
+			data.EpInfo = epInfo
+		}
+		data.EpList = append(data.EpList, epInfo)
+	}
+
+	sort.Slice(data.EpList, func(i, j int) bool {
+		return data.EpList[i].EpID < data.EpList[j].EpID
+	})
+
 	if !extractOption.Playlist {
 		aid := data.EpInfo.Aid
 		cid := data.EpInfo.Cid
 		bvid := data.EpInfo.BVid
+		titleFormat := data.EpInfo.TitleFormat
+		longTitle := data.EpInfo.LongTitle
 		if aid <= 0 || cid <= 0 || bvid == "" {
 			aid = data.EpList[0].Aid
 			cid = data.EpList[0].Cid
 			bvid = data.EpList[0].BVid
+			titleFormat = data.EpList[0].TitleFormat
+			longTitle = data.EpList[0].LongTitle
 		}
 		options := bilibiliOptions{
 			url:     url,
@@ -114,6 +147,8 @@ func extractBangumi(url, html string, extractOption extractors.Options) ([]*extr
 			aid:     aid,
 			cid:     cid,
 			bvid:    bvid,
+
+			subtitle: fmt.Sprintf("%s %s", titleFormat, longTitle),
 		}
 		return []*extractors.Data{bilibiliDownload(options, extractOption)}, nil
 	}
@@ -124,7 +159,7 @@ func extractBangumi(url, html string, extractOption extractors.Options) ([]*extr
 	wgp := utils.NewWaitGroupPool(extractOption.ThreadNumber)
 	dataIndex := 0
 	for index, u := range data.EpList {
-		if !array.ItemInArray(index+1, needDownloadItems) {
+		if !slices.Contains(needDownloadItems, index+1) {
 			continue
 		}
 		wgp.Add()
@@ -139,6 +174,8 @@ func extractBangumi(url, html string, extractOption extractors.Options) ([]*extr
 			aid:     u.Aid,
 			cid:     u.Cid,
 			bvid:    u.BVid,
+
+			subtitle: fmt.Sprintf("%s %s", u.TitleFormat, u.LongTitle),
 		}
 		go func(index int, options bilibiliOptions, extractedData []*extractors.Data) {
 			defer wgp.Done()
@@ -223,7 +260,7 @@ func multiEpisodeDownload(url, html string, extractOption extractors.Options, pa
 	wgp := utils.NewWaitGroupPool(extractOption.ThreadNumber)
 	dataIndex := 0
 	for index, u := range pageData.Sections[0].Episodes {
-		if !array.ItemInArray(index+1, needDownloadItems) {
+		if !slices.Contains(needDownloadItems, index+1) {
 			continue
 		}
 		wgp.Add()
@@ -252,7 +289,7 @@ func multiPageDownload(url, html string, extractOption extractors.Options, pageD
 	wgp := utils.NewWaitGroupPool(extractOption.ThreadNumber)
 	dataIndex := 0
 	for index, u := range pageData.VideoData.Pages {
-		if !array.ItemInArray(index+1, needDownloadItems) {
+		if !slices.Contains(needDownloadItems, index+1) {
 			continue
 		}
 		wgp.Add()
@@ -425,10 +462,14 @@ func bilibiliDownload(options bilibiliOptions, extractOption extractors.Options)
 	}
 	title := parser.Title(doc)
 	if options.subtitle != "" {
+		pageString := ""
+		if options.page > 0 {
+			pageString = fmt.Sprintf("P%d ", options.page)
+		}
 		if extractOption.EpisodeTitleOnly {
-			title = fmt.Sprintf("P%d %s", options.page, options.subtitle)
+			title = fmt.Sprintf("%s%s", pageString, options.subtitle)
 		} else {
-			title = fmt.Sprintf("%s P%d %s", title, options.page, options.subtitle)
+			title = fmt.Sprintf("%s %s%s", title, pageString, options.subtitle)
 		}
 	}
 
@@ -460,7 +501,7 @@ func getExtFromMimeType(mimeType string) string {
 
 func getSubTitleCaptionPart(aid int, cid int) *extractors.CaptionPart {
 	jsonString, err := request.Get(
-		fmt.Sprintf("http://api.bilibili.com/x/web-interface/view?aid=%d&cid=%d", aid, cid), referer, nil,
+		fmt.Sprintf("http://api.bilibili.com/x/player/wbi/v2?aid=%d&cid=%d", aid, cid), referer, nil,
 	)
 	if err != nil {
 		return nil
@@ -472,7 +513,7 @@ func getSubTitleCaptionPart(aid int, cid int) *extractors.CaptionPart {
 	}
 	return &extractors.CaptionPart{
 		Part: extractors.Part{
-			URL: stu.Data.SubtitleInfo.SubtitleList[0].SubtitleUrl,
+			URL: fmt.Sprintf("https:%s", stu.Data.SubtitleInfo.SubtitleList[0].SubtitleUrl),
 			Ext: "srt",
 		},
 		Transform: subtitleTransform,
